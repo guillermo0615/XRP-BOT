@@ -1,31 +1,3 @@
-"""
-XRP Trading Bot - Optimized Strategy
-
-Indicators:
-  - EMA 9 / 21 crossover  - trend direction
-  - RSI(14)               - momentum filter
-  - MACD(12,26,9)         - trend confirmation
-  - ATR(14)               - dynamic stop loss
-  - Volume filter         - only trade on above-average volume
-
-Entry (BUY):
-  - EMA9 crosses above EMA21
-  - RSI between 40-60
-  - MACD line > Signal line (fresh crossover)
-  - Volume > 20-bar average
-
-Exit (SELL) - first condition that triggers:
-  1. ATR stop loss:   entry - (2.0 x ATR)
-  2. Take profit:     entry + (3.5 x ATR)  1.75:1 R/R
-  3. Trailing stop:   activates at +1.5x ATR gain, locks at entry + 0.5x ATR
-  4. Bearish EMA cross + RSI > 55
-
-Candle data: Kraken public API (no key required) - XRP/USD 15-min
-Orders:      Robinhood Crypto Trading API (official, authenticated)
-Timeframe:   15-minute candles, loop every 15 minutes
-Trade size:  $20 per trade (configurable via TRADE_AMOUNT env var)
-"""
-
 import os
 import time
 import json
@@ -36,14 +8,12 @@ import numpy as np
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-# Config
 API_KEY_ID   = os.environ["RH_API_KEY_ID"]
 PRIVATE_KEY  = os.environ["RH_PRIVATE_KEY"]
 SYMBOL       = "XRP-USD"
 TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))
 INTERVAL_SEC = int(os.environ.get("INTERVAL_SEC", "900"))
 
-# Strategy parameters
 ATR_PERIOD      = 14
 ATR_STOP_MULT   = 2.0
 ATR_TARGET_MULT = 3.5
@@ -53,7 +23,6 @@ VOLUME_PERIOD   = 20
 
 RH_BASE_URL = "https://trading.robinhood.com"
 
-# Robinhood Auth
 def get_pkey():
     return Ed25519PrivateKey.from_private_bytes(base64.b64decode(PRIVATE_KEY))
 
@@ -75,46 +44,34 @@ def rh_get(path):
 
 def rh_post(path, body):
     s = json.dumps(body)
-    r = requests.post(RH_BASE_URL + path, headers=sign("POST", path, s),
-                      data=s, timeout=10)
+    r = requests.post(RH_BASE_URL + path, headers=sign("POST", path, s), data=s, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# Market Data - Kraken public API, no key needed
 def fetch_candles():
     url = "https://api.kraken.com/0/public/OHLC?pair=XRPUSD&interval=15"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     data = r.json()
-
     if data.get("error"):
         raise ValueError(f"Kraken error: {data['error']}")
-
     pts = data["result"].get("XXRPZUSD") or data["result"].get("XRPUSD")
     if pts is None:
-        raise ValueError(f"Unexpected Kraken result keys: {list(data['result'].keys())}")
-
+        raise ValueError(f"Unexpected Kraken keys: {list(data['result'].keys())}")
     if len(pts) < 50:
         raise ValueError(f"Not enough candles: {len(pts)}")
-
-    df = pd.DataFrame(pts, columns=[
-        "time", "open", "high", "low", "close", "vwap", "volume", "count"
-    ])
+    df = pd.DataFrame(pts, columns=["time","open","high","low","close","vwap","volume","count"])
     df["close"]  = df["close"].astype(float)
     df["high"]   = df["high"].astype(float)
     df["low"]    = df["low"].astype(float)
     df["volume"] = df["volume"].astype(float)
-
-    df = df.iloc[:-1].reset_index(drop=True)
-    return df
+    return df.iloc[:-1].reset_index(drop=True)
 
 def get_price():
     path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={SYMBOL}"
     d = rh_get(path)["results"][0]
-    return (float(d["ask_inclusive_of_buy_spread"]) +
-            float(d["bid_inclusive_of_sell_spread"])) / 2
+    return (float(d["ask_inclusive_of_buy_spread"]) + float(d["bid_inclusive_of_sell_spread"])) / 2
 
-# Indicators
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
@@ -135,15 +92,14 @@ def atr(df, n=14):
     return tr.ewm(span=n, adjust=False).mean()
 
 def compute(df):
-    df["ema9"]    = ema(df["close"], 9)
-    df["ema21"]   = ema(df["close"], 21)
-    df["rsi"]     = rsi(df["close"], 14)
+    df["ema9"]  = ema(df["close"], 9)
+    df["ema21"] = ema(df["close"], 21)
+    df["rsi"]   = rsi(df["close"], 14)
     df["macd"], df["macd_sig"] = macd(df["close"])
     df["atr"]     = atr(df, ATR_PERIOD)
     df["vol_avg"] = df["volume"].rolling(VOLUME_PERIOD).mean()
     return df
 
-# Orders
 def get_holdings():
     for h in rh_get("/api/v1/crypto/trading/holdings/").get("results", []):
         if h["asset_code"] == "XRP":
@@ -152,40 +108,24 @@ def get_holdings():
 
 def buy(usd):
     r = rh_post("/api/v1/crypto/trading/orders/", {
-        "symbol": SYMBOL,
-        "side":   "buy",
-        "type":   "market",
-        "market_order_config": {
-            "asset_quantity": None,
-            "quote_amount":   str(round(usd, 2)),
-        },
+        "symbol": SYMBOL, "side": "buy", "type": "market",
+        "market_order_config": {"asset_quantity": None, "quote_amount": str(round(usd, 2))},
     })
     log(f"BUY ${usd} -> order {r.get('id')}")
     return r
 
 def sell(qty):
     r = rh_post("/api/v1/crypto/trading/orders/", {
-        "symbol": SYMBOL,
-        "side":   "sell",
-        "type":   "market",
-        "market_order_config": {
-            "asset_quantity": str(round(qty, 6)),
-            "quote_amount":   None,
-        },
+        "symbol": SYMBOL, "side": "sell", "type": "market",
+        "market_order_config": {"asset_quantity": str(round(qty, 6)), "quote_amount": None},
     })
     log(f"SELL {qty} XRP -> order {r.get('id')}")
     return r
 
-# Position State
 pos = {
-    "active":       False,
-    "entry":        0.0,
-    "qty":          0.0,
-    "stop":         0.0,
-    "target":       0.0,
-    "trail_active": False,
-    "trail_stop":   0.0,
-    "atr_at_entry": 0.0,
+    "active": False, "entry": 0.0, "qty": 0.0,
+    "stop": 0.0, "target": 0.0,
+    "trail_active": False, "trail_stop": 0.0, "atr_at_entry": 0.0,
 }
 
 def log(msg):
@@ -193,14 +133,10 @@ def log(msg):
 
 def open_position(price, qty, atr_val):
     pos.update({
-        "active":       True,
-        "entry":        price,
-        "qty":          qty,
-        "stop":         price - (ATR_STOP_MULT   * atr_val),
-        "target":       price + (ATR_TARGET_MULT * atr_val),
-        "trail_active": False,
-        "trail_stop":   0.0,
-        "atr_at_entry": atr_val,
+        "active": True, "entry": price, "qty": qty,
+        "stop":   price - (ATR_STOP_MULT * atr_val),
+        "target": price + (ATR_TARGET_MULT * atr_val),
+        "trail_active": False, "trail_stop": 0.0, "atr_at_entry": atr_val,
     })
     log(f"POSITION OPEN | Entry={price:.4f} | SL={pos['stop']:.4f} | TP={pos['target']:.4f} | ATR={atr_val:.4f}")
 
@@ -209,28 +145,22 @@ def close_position(reason):
     log(f"POSITION CLOSED - {reason}")
     pos["active"] = False
 
-# Main Loop
 def run():
-    log("=" * 60)
-    log("XRP BOT STARTED - Optimized 5-Indicator Strategy")
-    log("Candle source: Kraken public API (15-min XRP/USD)")
-    log(f"EMA 9/21 | RSI(14) | MACD(12,26,9) | ATR(14) | Volume Filter")
-    log(f"SL: {ATR_STOP_MULT}x ATR | TP: {ATR_TARGET_MULT}x ATR | Trailing: {ATR_TRAIL_MULT}x ATR")
-    log("=" * 60)
+    log("XRP BOT STARTED")
+    log(f"SL={ATR_STOP_MULT}x ATR | TP={ATR_TARGET_MULT}x ATR | Trail={ATR_TRAIL_MULT}x ATR | Size=${TRADE_AMOUNT}")
 
     held = get_holdings()
     if held > 0.01:
         price = get_price()
         df    = compute(fetch_candles())
-        atr_v = df["atr"].iloc[-1]
-        open_position(price, held, atr_v)
+        open_position(price, held, df["atr"].iloc[-1])
         log(f"Resumed existing position of {held:.4f} XRP")
 
     while True:
         try:
-            df   = compute(fetch_candles())
-            prev = df.iloc[-2]
-            last = df.iloc[-1]
+            df    = compute(fetch_candles())
+            prev  = df.iloc[-2]
+            last  = df.iloc[-1]
             price = get_price()
 
             ema9       = last["ema9"]
@@ -271,28 +201,26 @@ def run():
                     close_position(f"Bearish EMA cross + RSI={rsi_v:.1f}")
 
             else:
-                ema_cross_up  = ema9 > ema21 and prev_ema9 <= prev_ema21
-                rsi_ok        = 40 <= rsi_v <= 60
-                macd_bullish  = macd_v > macd_sig_v and prev_macd <= prev_macd_sig
-                volume_ok     = vol > vol_avg
+                ema_cross_up = ema9 > ema21 and prev_ema9 <= prev_ema21
+                rsi_ok       = 40 <= rsi_v <= 60
+                macd_bullish = macd_v > macd_sig_v and prev_macd <= prev_macd_sig
+                volume_ok    = vol > vol_avg
 
                 if ema_cross_up and rsi_ok and macd_bullish and volume_ok:
-                    log(f"BUY SIGNAL | EMA cross OK RSI={rsi_v:.1f} OK MACD bullish OK Volume OK")
+                    log(f"BUY SIGNAL | EMA cross OK | RSI={rsi_v:.1f} | MACD bullish | Volume OK")
                     buy(TRADE_AMOUNT)
                     open_position(price, TRADE_AMOUNT / price, atr_v)
-
                 elif ema_cross_up:
                     reasons = []
                     if not rsi_ok:       reasons.append(f"RSI={rsi_v:.1f} out of 40-60")
                     if not macd_bullish: reasons.append("MACD not confirmed")
-                    if not volume_ok:    reasons.append("Volume below average")
-                    log(f"EMA cross seen but SKIPPED - {', '.join(reasons)}")
+                    if not volume_ok:    reasons.append("Volume LOW")
+                    log(f"EMA cross SKIPPED - {', '.join(reasons)}")
 
         except Exception as e:
             log(f"ERROR: {e}")
 
         time.sleep(INTERVAL_SEC)
-
 
 if __name__ == "__main__":
     run()
